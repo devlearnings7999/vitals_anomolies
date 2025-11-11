@@ -1,74 +1,43 @@
 # Vitals Anomaly Detector
 
-This project contains a Python script that consumes real-time health vitals data from a Kafka topic, detects anomalies, and publishes them to another Kafka topic.
+This project reads health vitals data from a Kafka topic, detects anomalies, and publishes the anomalies and average vitals to other Kafka topics.
 
-## Project Structure
+## Prerequisites
 
-```
-vitals_anomolies/
-├── .env
-├── main.py
-├── Dockerfile
-├── requirements.txt
-└── README.md
-```
+*   Docker
+*   Kafka cluster
 
-## Setup and Usage
+## Setup
 
-### 1. Environment Configuration
+1.  Clone the repository.
+2.  Navigate to the project directory: `/home/devraj-hireraddi/test_folder/Vitals_Anomolies`
+3.  Create a `.env` file in the project directory with the following variables:
+    *   `KAFKA_BROKER`: Kafka broker address (e.g., `your_kafka_broker:9092`)
+    *   `KAFKA_TOPIC_VITALS`: Kafka topic for input vitals data (`vitals-ml-test1`)
+    *   `KAFKA_TOPIC_ANOMALIES`: Kafka topic for anomaly data (`vitals_anomalies`)
+    *   `KAFKA_TOPIC_ANOMALIES_AVG`: Kafka topic for average vitals data (`vitals_anomalies_avg`)
+    *   `SECURITY_PROTOCOL`: Security protocol (`SASL_PLAINTEXT` or `PLAINTEXT`)
+    *   `SASL_MECHANISM`: SASL mechanism (`SCRAM-SHA-512` if using SASL)
+    *   `SASL_USERNAME`: Kafka username (if using SASL)
+    *   `SASL_PASSWORD`: Kafka password (if using SASL)
 
-Create a `.env` file in the `vitals_anomolies` directory with your Kafka connection details and topic names. A sample `.env` file is provided below:
+## Running the Application
 
-```
-KAFKA_BOOTSTRAP_SERVERS=localhost:9092
-CONSUMER_TOPIC=vitals-ml-test1
-PRODUCER_TOPIC=vitals_anomalies
-SECURITY_PROTOCOL=SASL_PLAINTEXT
-SASL_MECHANISM=SCRAM-SHA-512
-SASL_USERNAME=user
-SASL_PASSWORD=password
-```
+1.  Build the Docker image:
 
-*   `KAFKA_BOOTSTRAP_SERVERS`: The Kafka broker address.
-*   `CONSUMER_TOPIC`: The topic from which health vitals data will be consumed (e.g., `vitals-ml-test1`).
-*   `PRODUCER_TOPIC`: The topic to which detected anomalies will be published (e.g., `vitals_anomalies`).
-*   `SECURITY_PROTOCOL`: The security protocol for Kafka connection (e.g., `SASL_PLAINTEXT`).
-*   `SASL_MECHANISM`: The SASL mechanism for authentication (e.g., `SCRAM-SHA-512`).
-*   `SASL_USERNAME`: The SASL username for authentication.
-*   `SASL_PASSWORD`: The SASL password for authentication.
-
-### 2. Build the Docker Image
-
-Navigate to the `vitals_anomolies` directory in your terminal and build the Docker image:
-
-```bash
-docker build -t vitals-anomaly-detector .
-```
-
-### 3. Run the Docker Container
-
-Run the Docker container, mounting the `.env` file to provide the Kafka configuration:
-
-```bash
-docker run -d --name anomaly-detector --env-file ./.env vitals-anomaly-detector
-```
-
-### 4. Verify Functionality
-
-*   **Console Output:** Check the Docker container logs to see detected anomalies printed to the console:
     ```bash
-    docker logs anomaly-detector
+    docker build -t vitals-anomaly-detector .
     ```
-*   **Kafka Topic:** Verify that anomaly messages are being published to the `vitals_anomalies` Kafka topic using a Kafka consumer tool.
 
-### Anomaly Detection Logic
+2.  Run the Docker container:
 
-The script detects anomalies based on the following rules:
+    ```bash
+    docker run -d --name vitals-anomaly-detector --env-file .env vitals-anomaly-detector
+    ```
 
-*   Body temperature > 38 or < 35 (Celsius)
-*   Heart rate > 100 or < 50 (beats per minute)
-*   Oxygen < 92 (%)
+## Notes
 
-### Dead Letter Queue (DLQ)
-
-Messages that fail to be published to the `PRODUCER_TOPIC` after retries will be sent to a Dead Letter Queue topic, which will be named `vitals_anomalies_dlq` by default.
+*   Make sure the Kafka topics are created before running the application.
+*   Adjust the anomaly thresholds in `main.py` as needed.
+*   The application uses exponential backoff for retries when publishing messages to Kafka.
+*   Messages that fail to publish after multiple retries are sent to a dead-letter topic (`vitals_anomalies_dead_letter`).

@@ -1,128 +1,182 @@
-import os
 import json
+import os
+import time
+from datetime import datetime
 from dotenv import load_dotenv
 from kafka import KafkaConsumer, KafkaProducer
 from kafka.errors import KafkaError
+import logging
+import random
+import concurrent.futures
 
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Load environment variables
 load_dotenv()
+KAFKA_BROKER = os.getenv('KAFKA_BROKER')
+KAFKA_TOPIC_VITALS = os.getenv('KAFKA_TOPIC_VITALS')
+KAFKA_TOPIC_ANOMALIES = os.getenv('KAFKA_TOPIC_ANOMALIES')
+KAFKA_TOPIC_ANOMALIES_AVG = os.getenv('KAFKA_TOPIC_ANOMALIES_AVG')
+SECURITY_PROTOCOL = os.getenv('SECURITY_PROTOCOL', 'PLAINTEXT')
+SASL_MECHANISM = os.getenv('SASL_MECHANISM', None)
+SASL_USERNAME = os.getenv('SASL_USERNAME', None)
+SASL_PASSWORD = os.getenv('SASL_PASSWORD', None)
+RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 2
+DEAD_LETTER_TOPIC = 'vitals_anomalies_dead_letter'  # Define dead-letter topic
 
 # Kafka configuration
-KAFKA_BOOTSTRAP_SERVERS = os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')
-CONSUMER_TOPIC = os.getenv('CONSUMER_TOPIC', 'vitals-ml-test1')
-PRODUCER_TOPIC = os.getenv('PRODUCER_TOPIC', 'vitals_anomalies')
-SECURITY_PROTOCOL = os.getenv('SECURITY_PROTOCOL', 'SASL_PLAINTEXT')
-SASL_MECHANISM = os.getenv('SASL_MECHANISM', 'SCRAM-SHA-512')
-SASL_USERNAME = os.getenv('SASL_USERNAME', 'user')
-SASL_PASSWORD = os.getenv('SASL_PASSWORD', 'password')
+kafka_config = {
+    'bootstrap_servers': KAFKA_BROKER,
+    'security_protocol': SECURITY_PROTOCOL,
+    'value_deserializer': lambda x: json.loads(x.decode('utf-8')),
+    'api_version': (0, 10, 1)
+}
 
-# Dead-letter topic
-DEAD_LETTER_TOPIC = f"{PRODUCER_TOPIC}_dlq"
+if SECURITY_PROTOCOL == 'SASL_PLAINTEXT':
+    kafka_config['sasl_mechanism'] = SASL_MECHANISM
+    kafka_config['sasl_plain_username'] = SASL_USERNAME
+    kafka_config['sasl_plain_password'] = SASL_PASSWORD
 
-def serialize_json(obj):
-    return json.dumps(obj).encode('utf-8')
+anomaly_thresholds = {
+    'body_temp': (35, 38),
+    'heart_rate': (50, 100),
+    'oxygen': (92, 100)
+}
 
-def deserialize_json(message):
-    return json.loads(message.decode('utf-8'))
 
-def detect_anomaly(vitals):
+def create_kafka_producer():
+    producer = KafkaProducer(
+        bootstrap_servers=KAFKA_BROKER,
+        security_protocol=SECURITY_PROTOCOL,
+        value_serializer=lambda x: json.dumps(x).encode('utf-8'),
+        api_version=(0, 10, 1)
+    )
+    if SECURITY_PROTOCOL == 'SASL_PLAINTEXT':
+        producer.config['sasl_mechanism'] = SASL_MECHANISM
+        producer.config['sasl_plain_username'] = SASL_USERNAME
+        producer.config['sasl_plain_password'] = SASL_PASSWORD
+    return producer
+
+def publish_message(producer, topic, message, retry_attempts=RETRY_ATTEMPTS, retry_backoff=RETRY_BACKOFF_SECONDS):
+    for attempt in range(retry_attempts):
+        try:
+            producer.send(topic, value=message).get(timeout=10)  # Adjust timeout as needed
+            logging.info(f"Published message to topic {topic}: {message}")
+            return True
+        except KafkaError as e:
+            logging.error(f"Failed to publish message (attempt {attempt + 1}/{retry_attempts}): {e}")
+            if attempt < retry_attempts - 1:
+                time.sleep(retry_backoff ** (attempt + 1))  # Exponential backoff
+            else:
+                logging.error(f"Failed to publish message after {retry_attempts} attempts. Sending to dead-letter topic.")
+                send_to_dead_letter_topic(producer, message)
+            return False
+
+def send_to_dead_letter_topic(producer, message):
+    try:
+        producer.send(DEAD_LETTER_TOPIC, value=message).get(timeout=10)
+        logging.info(f"Published message to dead-letter topic {DEAD_LETTER_TOPIC}: {message}")
+    except KafkaError as e:
+        logging.error(f"Failed to publish message to dead-letter topic: {e}")
+
+def detect_anomalies(vitals):
     anomalies = []
-    if vitals['body_temp'] > 38 or vitals['body_temp'] < 35:
-        anomalies.append(f"Body temperature anomaly: {vitals['body_temp']}°C")
-    if vitals['heart_rate'] > 100 or vitals['heart_rate'] < 50:
-        anomalies.append(f"Heart rate anomaly: {vitals['heart_rate']} bpm")
-    if vitals['oxygen'] < 92:
-        anomalies.append(f"Oxygen anomaly: {vitals['oxygen']}%")
+    if not isinstance(vitals, dict):
+        logging.warning(f"Received non-dictionary vitals: {vitals}")
+        return anomalies
+
+    if not all(key in vitals for key in ['body_temp', 'heart_rate', 'systolic', 'diastolic', 'breaths', 'oxygen', 'glucose']):
+         logging.warning(f"Missing keys in vitals data: {vitals}")
+         return anomalies
+
+    if not all(isinstance(vitals[key], (int, float)) for key in ['body_temp', 'heart_rate', 'systolic', 'diastolic', 'breaths', 'oxygen', 'glucose']):
+        logging.warning(f"Incorrect data types in vitals data: {vitals}")
+        return anomalies
+
+
+    if vitals['body_temp'] > anomaly_thresholds['body_temp'][1] or vitals['body_temp'] < anomaly_thresholds['body_temp'][0]:
+        anomalies.append(f"Body Temperature: {vitals['body_temp']}")
+    if vitals['heart_rate'] > anomaly_thresholds['heart_rate'][1] or vitals['heart_rate'] < anomaly_thresholds['heart_rate'][0]:
+        anomalies.append(f"Heart Rate: {vitals['heart_rate']}")
+    if vitals['oxygen'] < anomaly_thresholds['oxygen'][0]:
+        anomalies.append(f"Oxygen: {vitals['oxygen']}")
+
     return anomalies
 
-def main():
-    consumer = None
-    producer = None
-    dlq_producer = None
+def process_vitals(vitals, producer):
+    anomalies = detect_anomalies(vitals)
+    if anomalies:
+        anomaly_message = {
+            'timestamp': datetime.now().isoformat(),
+            'vitals': vitals,
+            'anomalies': anomalies
+        }
+        print(f"Detected anomalies: {anomaly_message}")
+        publish_message(producer, KAFKA_TOPIC_ANOMALIES, anomaly_message)
+
+
+def consume_vitals(producer):
+    consumer = KafkaConsumer(
+        KAFKA_TOPIC_VITALS,
+        **kafka_config,
+        auto_offset_reset='latest',
+        enable_auto_commit=True
+    )
+
+    vitals_buffer = []
+    last_published = time.time()
 
     try:
-        # Initialize Kafka Consumer
-        consumer = KafkaConsumer(
-            CONSUMER_TOPIC,
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            security_protocol=SECURITY_PROTOCOL,
-            sasl_mechanism=SASL_MECHANISM,
-            sasl_plain_username=SASL_USERNAME,
-            sasl_plain_password=SASL_PASSWORD,
-            value_deserializer=deserialize_json,
-            auto_offset_reset='earliest',
-            enable_auto_commit=True,
-            group_id='vitals-anomaly-detector'
-        )
-        print(f"Connected to Kafka consumer topic: {CONSUMER_TOPIC}")
-
-        # Initialize Kafka Producer for anomalies
-        producer = KafkaProducer(
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            security_protocol=SECURITY_PROTOCOL,
-            sasl_mechanism=SASL_MECHANISM,
-            sasl_plain_username=SASL_USERNAME,
-            sasl_plain_password=SASL_PASSWORD,
-            value_serializer=serialize_json,
-            retries=5,  # Retry up to 5 times
-            acks='all'  # Ensure all replicas acknowledge the message
-        )
-        print(f"Connected to Kafka producer topic: {PRODUCER_TOPIC}")
-
-        # Initialize Kafka Producer for Dead Letter Queue
-        dlq_producer = KafkaProducer(
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            security_protocol=SECURITY_PROTOCOL,
-            sasl_mechanism=SASL_MECHANISM,
-            sasl_plain_username=SASL_USERNAME,
-            sasl_plain_password=SASL_PASSWORD,
-            value_serializer=serialize_json
-        )
-        print(f"Connected to Kafka DLQ topic: {DEAD_LETTER_TOPIC}")
-
         for message in consumer:
-            vitals_data = message.value
-            if vitals_data:
-                print(f"Received vital data: {vitals_data}")
-                anomalies = detect_anomaly(vitals_data)
+            vitals = message.value
+            vitals_buffer.append(vitals)
+            process_vitals(vitals, producer)
 
-                if anomalies:
-                    anomaly_report = {
-                        "original_message": vitals_data,
-                        "anomalies": anomalies,
-                        "timestamp": os.getenv('CURRENT_TIMESTAMP') # A placeholder for timestamp generation if needed
-                    }
-                    print(f"ANOMALY DETECTED: {anomaly_report}")
-
-                    try:
-                        future = producer.send(PRODUCER_TOPIC, value=anomaly_report)
-                        record_metadata = future.get(timeout=10) # Block until send is complete or timeout
-                        print(f"Anomaly published to topic: {record_metadata.topic}, partition: {record_metadata.partition}, offset: {record_metadata.offset}")
-                    except KafkaError as e:
-                        print(f"Failed to publish anomaly to {PRODUCER_TOPIC}. Sending to DLQ. Error: {e}")
-                        try:
-                            dlq_producer.send(DEAD_LETTER_TOPIC, value={"original_message": vitals_data, "error": str(e)})
-                            dlq_producer.flush()
-                        except KafkaError as dlq_e:
-                            print(f"Failed to send message to DLQ: {dlq_e}")
+            # Calculate and publish averages every 10 seconds
+            if time.time() - last_published >= 10:
+                if vitals_buffer:
+                    avg_vitals = calculate_average_vitals(vitals_buffer)
+                    publish_message(producer, KAFKA_TOPIC_ANOMALIES_AVG, avg_vitals)
+                    vitals_buffer = []  # Clear the buffer
+                    last_published = time.time()
                 else:
-                    print("No anomalies detected.")
-            else:
-                print("Received empty or malformed message.")
+                    logging.info("No vitals data to average in the last 10 seconds.")
+
 
     except KafkaError as e:
-        print(f"Kafka error: {e}")
+        logging.error(f"Consumer error: {e}")
     except Exception as e:
-        print(f"An unexpected error occurred: {e}")
+        logging.error(f"General error: {e}")
     finally:
-        if consumer:
-            consumer.close()
-            print("Kafka consumer closed.")
-        if producer:
-            producer.close()
-            print("Kafka producer closed.")
-        if dlq_producer:
-            dlq_producer.close()
-            print("Kafka DLQ producer closed.")
+        consumer.close()
+
+
+def calculate_average_vitals(vitals_list):
+    if not vitals_list:
+        return {}
+
+    summed_vitals = {}
+    for vitals in vitals_list:
+        for key, value in vitals.items():
+            if isinstance(value, (int, float)):
+                summed_vitals.setdefault(key, 0)
+                summed_vitals[key] += value
+
+    avg_vitals = {k: v / len(vitals_list) for k, v in summed_vitals.items()}
+    return avg_vitals
+
+
+def main():
+    producer = create_kafka_producer()
+    try:
+        consume_vitals(producer)
+    except Exception as e:
+        logging.error(f"Main function error: {e}")
+    finally:
+        producer.close()
+
 
 if __name__ == "__main__":
     main()
